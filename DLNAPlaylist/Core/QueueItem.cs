@@ -7,11 +7,11 @@ public enum QueueItemStatus
     Playing,
     Paused,
     Done,
-    Failed,
+    Failed
 }
 
 /// <summary>
-/// 队列中的一项。Id 是会话内唯一，不持久化。
+///     队列中的一项。Id 是会话内唯一，不持久化。
 /// </summary>
 public sealed class QueueItem
 {

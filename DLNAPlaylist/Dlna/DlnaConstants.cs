@@ -1,7 +1,7 @@
 namespace DLNAPlaylist.Dlna;
 
 /// <summary>
-/// 全局常量。UUID 每次进程启动随机生成（不持久化即决策）。
+///     全局常量。UUID 每次进程启动随机生成（不持久化即决策）。
 /// </summary>
 public static class DlnaConstants
 {

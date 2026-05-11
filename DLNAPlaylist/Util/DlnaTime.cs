@@ -3,17 +3,17 @@ using System.Globalization;
 namespace DLNAPlaylist.Util;
 
 /// <summary>
-/// DLNA 的时间格式：hh:mm:ss[.fff] 或 h:mm:ss。
-/// InvariantGlobalization=true 下我们手动解析/拼装。
+///     DLNA 的时间格式：hh:mm:ss[.fff] 或 h:mm:ss。
+///     InvariantGlobalization=true 下我们手动解析/拼装。
 /// </summary>
 public static class DlnaTime
 {
     public static string Format(TimeSpan ts)
     {
         if (ts < TimeSpan.Zero) ts = TimeSpan.Zero;
-        int h = (int)ts.TotalHours;
-        int m = ts.Minutes;
-        int s = ts.Seconds;
+        var h = (int)ts.TotalHours;
+        var m = ts.Minutes;
+        var s = ts.Seconds;
         return string.Create(CultureInfo.InvariantCulture, $"{h}:{m:D2}:{s:D2}");
     }
 
@@ -38,6 +38,9 @@ public static class DlnaTime
         {
             return new TimeSpan(h, m, s);
         }
-        catch { return null; }
+        catch
+        {
+            return null;
+        }
     }
 }

@@ -1,7 +1,7 @@
 namespace DLNAPlaylist.Core;
 
 /// <summary>
-/// 被发现的远端 MR (电视/盒子) 的描述。
+///     被发现的远端 MR (电视/盒子) 的描述。
 /// </summary>
 public sealed record RemoteDevice(
     string Udn,

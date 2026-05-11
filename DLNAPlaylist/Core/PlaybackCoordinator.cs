@@ -1,41 +1,43 @@
 using System.Threading.Channels;
+
 using DLNAPlaylist.Dlna.Cp;
 using DLNAPlaylist.Media;
 using DLNAPlaylist.Util;
 
+using Microsoft.Extensions.Hosting;
+
 namespace DLNAPlaylist.Core;
 
 /// <summary>
-/// 中央状态机。
-/// - 唯一维护：队列、当前播放项、目标设备、审批列表
-/// - 唯一向电视发 SOAP 调用（通过 AvTransportClient）
-/// - 收到远端状态上报后判定"播完"→ 推进下一项
-///
-/// 所有外部操作（MR 入队 / TUI 点击 / CP 轮询上报）都压成 CoordinatorCommand 投进 Channel，
-/// 单循环消费，天然无锁。
+///     中央状态机。
+///     - 唯一维护：队列、当前播放项、目标设备、审批列表
+///     - 唯一向电视发 SOAP 调用（通过 AvTransportClient）
+///     - 收到远端状态上报后判定"播完"→ 推进下一项
+///     所有外部操作（MR 入队 / TUI 点击 / CP 轮询上报）都压成 CoordinatorCommand 投进 Channel，
+///     单循环消费，天然无锁。
 /// </summary>
-public sealed class PlaybackCoordinator : IAsyncDisposable
+public sealed class PlaybackCoordinator : IHostedService, IAsyncDisposable
 {
-    readonly Channel<CoordinatorCommand> _commands;
-    readonly EventBus<CoordinatorEvent> _bus;
-    readonly LogSink _log;
-    readonly AvTransportClient _cpClient;
-    readonly IMediaUrlResolver _resolver;
-    readonly AllowList _allowList;
-    readonly CancellationTokenSource _cts = new();
-    Task? _loopTask;
+    private readonly AllowList _allowList;
+    private readonly EventBus<CoordinatorEvent> _bus;
+    private readonly Channel<CoordinatorCommand> _commands;
+    private readonly AvTransportClient _cpClient;
+    private readonly CancellationTokenSource _cts = new();
+    private readonly List<RemoteDevice> _devices = [];
+    private readonly LogSink _log;
+    private readonly List<PendingApproval> _pending = [];
+    private readonly CurrentTargetHolder _targetHolder;
 
     // 状态
-    readonly List<QueueItem> _queue = new();
-    readonly List<PendingApproval> _pending = new();
-    readonly List<RemoteDevice> _devices = new();
-    RemoteDevice? _target;
-    QueueItem? _nowPlaying;
-    TimeSpan? _lastPos;
-    TimeSpan? _lastDur;
-    string _lastTransportState = "NO_MEDIA_PRESENT";
-    bool _wasPlayingOnce;  // 用于"播完"判定：曾进入过 PLAYING 才能由 STOPPED 触发推进
-    bool _isPaused;
+    private readonly List<QueueItem> _queue = [];
+    private readonly IMediaUrlResolver _resolver;
+    private bool _isPaused;
+    private TimeSpan? _lastDur;
+    private TimeSpan? _lastPos;
+    private string _lastTransportState = "NO_MEDIA_PRESENT";
+    private Task? _loopTask;
+    private QueueItem? _nowPlaying;
+    private bool _wasPlayingOnce; // 用于"播完"判定：曾进入过 PLAYING 才能由 STOPPED 触发推进
 
     public PlaybackCoordinator(
         Channel<CoordinatorCommand> commands,
@@ -43,7 +45,8 @@ public sealed class PlaybackCoordinator : IAsyncDisposable
         LogSink log,
         AvTransportClient cpClient,
         IMediaUrlResolver resolver,
-        AllowList allowList)
+        AllowList allowList,
+        CurrentTargetHolder targetHolder)
     {
         _commands = commands;
         _bus = bus;
@@ -51,24 +54,57 @@ public sealed class PlaybackCoordinator : IAsyncDisposable
         _cpClient = cpClient;
         _resolver = resolver;
         _allowList = allowList;
+        _targetHolder = targetHolder;
     }
 
-    public RemoteDevice? CurrentTarget => _target;
+    public RemoteDevice? CurrentTarget => _targetHolder.Current;
 
-    public void Start()
+    public Task StartAsync(CancellationToken cancellationToken)
     {
         _loopTask = Task.Run(() => LoopAsync(_cts.Token));
+        return Task.CompletedTask;
     }
 
-    async Task LoopAsync(CancellationToken ct)
+    public async Task StopAsync(CancellationToken cancellationToken)
+    {
+        await DisposeAsync().ConfigureAwait(false);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await _cts.CancelAsync();
+        _commands.Writer.TryComplete();
+        try
+        {
+            if (_loopTask is not null)
+                await _loopTask.ConfigureAwait(false);
+        }
+        catch
+        {
+            // ignored
+        }
+
+        _cts.Dispose();
+    }
+
+    private async Task LoopAsync(CancellationToken ct)
     {
         var reader = _commands.Reader;
         while (!ct.IsCancellationRequested)
         {
             CoordinatorCommand cmd;
-            try { cmd = await reader.ReadAsync(ct).ConfigureAwait(false); }
-            catch (OperationCanceledException) { break; }
-            catch (ChannelClosedException) { break; }
+            try
+            {
+                cmd = await reader.ReadAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (ChannelClosedException)
+            {
+                break;
+            }
 
             try
             {
@@ -81,7 +117,7 @@ public sealed class PlaybackCoordinator : IAsyncDisposable
         }
     }
 
-    async Task HandleAsync(CoordinatorCommand cmd, CancellationToken ct)
+    private async Task HandleAsync(CoordinatorCommand cmd, CancellationToken ct)
     {
         switch (cmd)
         {
@@ -109,7 +145,7 @@ public sealed class PlaybackCoordinator : IAsyncDisposable
 
     // ---------- 队列与审批 ----------
 
-    void HandleIncoming(QueueItem item)
+    private void HandleIncoming(QueueItem item)
     {
         // 来源是否已被允许
         if (item.Source is { } src && _allowList.IsAllowed(src))
@@ -128,7 +164,7 @@ public sealed class PlaybackCoordinator : IAsyncDisposable
         _log.Info("Coord", $"待审批：{item.Title} 来自 {item.Source?.Display ?? "?"}");
     }
 
-    void HandleApprove(Guid approvalId, bool rememberSource)
+    private void HandleApprove(Guid approvalId, bool rememberSource)
     {
         var idx = _pending.FindIndex(p => p.Id == approvalId);
         if (idx < 0) return;
@@ -144,7 +180,7 @@ public sealed class PlaybackCoordinator : IAsyncDisposable
         _ = TryAutoStartAsync();
     }
 
-    void HandleReject(Guid approvalId, bool blockSource)
+    private void HandleReject(Guid approvalId, bool blockSource)
     {
         var idx = _pending.FindIndex(p => p.Id == approvalId);
         if (idx < 0) return;
@@ -154,7 +190,7 @@ public sealed class PlaybackCoordinator : IAsyncDisposable
         BroadcastApprovals();
     }
 
-    void HandleEnqueueManual(string uri, string? title)
+    private void HandleEnqueueManual(string uri, string? title)
     {
         var item = new QueueItem
         {
@@ -162,14 +198,14 @@ public sealed class PlaybackCoordinator : IAsyncDisposable
             Title = title ?? uri,
             Kind = MediaKind.Unknown,
             Source = new SourceIdentity("manual", "TUI"),
-            Status = QueueItemStatus.Queued,
+            Status = QueueItemStatus.Queued
         };
         _queue.Add(item);
         BroadcastQueue();
         _ = TryAutoStartAsync();
     }
 
-    void HandleRemove(Guid itemId)
+    private void HandleRemove(Guid itemId)
     {
         var idx = _queue.FindIndex(q => q.Id == itemId);
         if (idx < 0) return;
@@ -182,11 +218,12 @@ public sealed class PlaybackCoordinator : IAsyncDisposable
             _ = TryAutoStartAsync();
             return;
         }
+
         _queue.RemoveAt(idx);
         BroadcastQueue();
     }
 
-    void HandleMove(Guid itemId, int delta)
+    private void HandleMove(Guid itemId, int delta)
     {
         var idx = _queue.FindIndex(q => q.Id == itemId);
         if (idx < 0) return;
@@ -198,7 +235,7 @@ public sealed class PlaybackCoordinator : IAsyncDisposable
         BroadcastQueue();
     }
 
-    void HandleClearQueue()
+    private void HandleClearQueue()
     {
         _queue.Clear();
         _nowPlaying = null;
@@ -208,27 +245,33 @@ public sealed class PlaybackCoordinator : IAsyncDisposable
 
     // ---------- 设备 ----------
 
-    void HandleDevicesDiscovered(IReadOnlyList<RemoteDevice> devices)
+    private void HandleDevicesDiscovered(IReadOnlyList<RemoteDevice> devices)
     {
         _devices.Clear();
         _devices.AddRange(devices);
         _bus.Publish(new CoordinatorEvent.DevicesChanged(_devices.ToArray()));
         // 如果当前 target 还在（按 UDN），保留；不在就清空
-        if (_target is not null && !_devices.Any(d => d.Udn == _target.Udn))
+        if (CurrentTarget is not null && !_devices.Any(d => d.Udn == CurrentTarget.Udn))
         {
-            _target = null;
+            _targetHolder.Set(null);
             _bus.Publish(new CoordinatorEvent.TargetChanged(null));
         }
     }
 
-    async Task HandleSetTargetAsync(RemoteDevice? device, CancellationToken ct)
+    private async Task HandleSetTargetAsync(RemoteDevice? device, CancellationToken ct)
     {
-        if (_target is not null && !ReferenceEquals(_target, device))
-        {
+        if (CurrentTarget is not null && !ReferenceEquals(CurrentTarget, device))
             // 离开旧设备前停它
-            try { await _cpClient.StopAsync(_target, ct); } catch { }
-        }
-        _target = device;
+            try
+            {
+                await _cpClient.StopAsync(CurrentTarget, ct);
+            }
+            catch
+            {
+                // ignored
+            }
+
+        _targetHolder.Set(device);
         _wasPlayingOnce = false;
         _isPaused = false;
         _nowPlaying = null;
@@ -239,40 +282,70 @@ public sealed class PlaybackCoordinator : IAsyncDisposable
 
     // ---------- 播放控制 ----------
 
-    async Task HandlePlayNowAsync(CancellationToken ct)
+    private async Task HandlePlayNowAsync(CancellationToken ct)
     {
-        if (_nowPlaying is not null && _target is not null)
+        if (_nowPlaying is not null && CurrentTarget is not null)
         {
-            try { await _cpClient.PlayAsync(_target, ct); _isPaused = false; BroadcastNowPlaying(); }
-            catch (Exception ex) { _log.Warn("Coord", $"play: {ex.Message}"); }
+            try
+            {
+                await _cpClient.PlayAsync(CurrentTarget, ct);
+                _isPaused = false;
+                BroadcastNowPlaying();
+            }
+            catch (Exception ex)
+            {
+                _log.Warn("Coord", $"play: {ex.Message}");
+            }
+
             return;
         }
+
         await TryAutoStartAsync(ct);
     }
 
-    async Task HandleToggleAsync(CancellationToken ct)
+    private async Task HandleToggleAsync(CancellationToken ct)
     {
-        if (_nowPlaying is null || _target is null) return;
+        if (_nowPlaying is null || CurrentTarget is null) return;
         try
         {
-            if (_isPaused) { await _cpClient.PlayAsync(_target, ct); _isPaused = false; }
-            else           { await _cpClient.PauseAsync(_target, ct); _isPaused = true; }
+            if (_isPaused)
+            {
+                await _cpClient.PlayAsync(CurrentTarget, ct);
+                _isPaused = false;
+            }
+            else
+            {
+                await _cpClient.PauseAsync(CurrentTarget, ct);
+                _isPaused = true;
+            }
+
             BroadcastNowPlaying();
         }
-        catch (Exception ex) { _log.Warn("Coord", $"toggle: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            _log.Warn("Coord", $"toggle: {ex.Message}");
+        }
     }
 
-    async Task HandleStopAsync(CancellationToken ct)
+    private async Task HandleStopAsync(CancellationToken ct)
     {
-        if (_target is null) return;
-        try { await _cpClient.StopAsync(_target, ct); } catch { }
+        if (CurrentTarget is null) return;
+        try
+        {
+            await _cpClient.StopAsync(CurrentTarget, ct);
+        }
+        catch
+        {
+            // ignored
+        }
+
         _nowPlaying = null;
         _isPaused = false;
         _wasPlayingOnce = false;
         BroadcastNowPlaying();
     }
 
-    async Task HandleNextAsync(CancellationToken ct)
+    private async Task HandleNextAsync(CancellationToken ct)
     {
         // 弹出当前播放（若在队列首）并起下一项
         if (_nowPlaying is not null)
@@ -280,33 +353,54 @@ public sealed class PlaybackCoordinator : IAsyncDisposable
             _queue.RemoveAll(q => q.Id == _nowPlaying.Id);
             _nowPlaying = null;
         }
+
         BroadcastQueue();
-        if (_target is not null) { try { await _cpClient.StopAsync(_target, ct); } catch { } }
+        if (CurrentTarget is not null)
+            try
+            {
+                await _cpClient.StopAsync(CurrentTarget, ct);
+            }
+            catch
+            {
+                // ignored
+            }
+
         _wasPlayingOnce = false;
         await TryAutoStartAsync(ct);
     }
 
-    Task HandlePreviousAsync(CancellationToken ct)
+    private Task HandlePreviousAsync(CancellationToken ct)
     {
         // "上一首"语义：重新从头播当前项
-        if (_nowPlaying is not null && _target is not null)
-        {
-            try { return _cpClient.SeekAsync(_target, TimeSpan.Zero, ct); }
-            catch { }
-        }
+        if (_nowPlaying is not null && CurrentTarget is not null)
+            try
+            {
+                return _cpClient.SeekAsync(CurrentTarget, TimeSpan.Zero, ct);
+            }
+            catch
+            {
+                // ignored
+            }
+
         return Task.CompletedTask;
     }
 
-    async Task HandleSeekAsync(TimeSpan position, CancellationToken ct)
+    private async Task HandleSeekAsync(TimeSpan position, CancellationToken ct)
     {
-        if (_target is null) return;
-        try { await _cpClient.SeekAsync(_target, position, ct); }
-        catch (Exception ex) { _log.Warn("Coord", $"seek: {ex.Message}"); }
+        if (CurrentTarget is null) return;
+        try
+        {
+            await _cpClient.SeekAsync(CurrentTarget, position, ct);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn("Coord", $"seek: {ex.Message}");
+        }
     }
 
     // ---------- 远端状态上报 ----------
 
-    async Task HandleRemoteReportAsync(CoordinatorCommand.RemoteStateReport x, CancellationToken ct)
+    private async Task HandleRemoteReportAsync(CoordinatorCommand.RemoteStateReport x, CancellationToken ct)
     {
         _lastPos = x.Position;
         _lastDur = x.Duration;
@@ -318,7 +412,7 @@ public sealed class PlaybackCoordinator : IAsyncDisposable
         var finished =
             _wasPlayingOnce &&
             previous is "PLAYING" or "TRANSITIONING" or "PAUSED_PLAYBACK" &&
-            (x.TransportState is "STOPPED" or "NO_MEDIA_PRESENT");
+            x.TransportState is "STOPPED" or "NO_MEDIA_PRESENT";
 
         if (finished && _nowPlaying is not null)
         {
@@ -336,25 +430,28 @@ public sealed class PlaybackCoordinator : IAsyncDisposable
 
     // ---------- 自动起播 ----------
 
-    Task TryAutoStartAsync() => TryAutoStartAsync(CancellationToken.None);
+    private Task TryAutoStartAsync()
+    {
+        return TryAutoStartAsync(CancellationToken.None);
+    }
 
-    async Task TryAutoStartAsync(CancellationToken ct)
+    private async Task TryAutoStartAsync(CancellationToken ct)
     {
         if (_nowPlaying is not null) return;
-        if (_target is null) return;
+        if (CurrentTarget is null) return;
         var next = _queue.FirstOrDefault(q => q.Status == QueueItemStatus.Queued);
         if (next is null) return;
 
         try
         {
-            var resolved = await _resolver.ResolveAsync(next, _target, ct).ConfigureAwait(false);
-            await _cpClient.SetUriAsync(_target, resolved.Uri, resolved.DidlLite, ct).ConfigureAwait(false);
-            await _cpClient.PlayAsync(_target, ct).ConfigureAwait(false);
+            var resolved = await _resolver.ResolveAsync(next, CurrentTarget, ct).ConfigureAwait(false);
+            await _cpClient.SetUriAsync(CurrentTarget, resolved.Uri, resolved.DidlLite, ct).ConfigureAwait(false);
+            await _cpClient.PlayAsync(CurrentTarget, ct).ConfigureAwait(false);
             next.Status = QueueItemStatus.Playing;
             _nowPlaying = next;
             _isPaused = false;
             _wasPlayingOnce = false;
-            _log.Info("Coord", $"开始播放：{next.Title} → {_target.Display}");
+            _log.Info("Coord", $"开始播放：{next.Title} → {CurrentTarget.Display}");
             BroadcastQueue();
             BroadcastNowPlaying();
         }
@@ -369,16 +466,19 @@ public sealed class PlaybackCoordinator : IAsyncDisposable
 
     // ---------- 广播 ----------
 
-    void BroadcastQueue() => _bus.Publish(new CoordinatorEvent.QueueChanged(_queue.ToArray()));
-    void BroadcastApprovals() => _bus.Publish(new CoordinatorEvent.ApprovalsChanged(_pending.ToArray()));
-    void BroadcastNowPlaying() =>
-        _bus.Publish(new CoordinatorEvent.NowPlayingChanged(_nowPlaying, _lastPos, _lastDur ?? _nowPlaying?.Duration, _isPaused));
-
-    public async ValueTask DisposeAsync()
+    private void BroadcastQueue()
     {
-        _cts.Cancel();
-        _commands.Writer.TryComplete();
-        try { if (_loopTask is not null) await _loopTask.ConfigureAwait(false); } catch { }
-        _cts.Dispose();
+        _bus.Publish(new CoordinatorEvent.QueueChanged(_queue.ToArray()));
+    }
+
+    private void BroadcastApprovals()
+    {
+        _bus.Publish(new CoordinatorEvent.ApprovalsChanged(_pending.ToArray()));
+    }
+
+    private void BroadcastNowPlaying()
+    {
+        _bus.Publish(new CoordinatorEvent.NowPlayingChanged(_nowPlaying, _lastPos, _lastDur ?? _nowPlaying?.Duration,
+            _isPaused));
     }
 }

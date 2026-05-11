@@ -5,5 +5,5 @@ public enum MediaKind
     Unknown,
     Video,
     Audio,
-    Image,
+    Image
 }

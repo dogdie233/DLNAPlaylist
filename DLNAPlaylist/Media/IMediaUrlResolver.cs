@@ -3,9 +3,9 @@ using DLNAPlaylist.Core;
 namespace DLNAPlaylist.Media;
 
 /// <summary>
-/// 把队列项最终要交给电视的 URL / DIDL 解析出来。
-/// 一期：PassthroughResolver 直接返回原 URL。
-/// 二期：可替换成代理实现（起本地 HTTP，重写 URL / DIDL res@）。
+///     把队列项最终要交给电视的 URL / DIDL 解析出来。
+///     一期：PassthroughResolver 直接返回原 URL。
+///     二期：可替换成代理实现（起本地 HTTP，重写 URL / DIDL res@）。
 /// </summary>
 public interface IMediaUrlResolver
 {
