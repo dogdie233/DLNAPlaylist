@@ -3,11 +3,13 @@ using System.Text;
 using System.Xml.Linq;
 
 using DLNAPlaylist.Core;
+using DLNAPlaylist.Media;
 using DLNAPlaylist.Util;
 
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
+using Microsoft.Net.Http.Headers;
 
 namespace DLNAPlaylist.Dlna.Http;
 
@@ -22,7 +24,7 @@ namespace DLNAPlaylist.Dlna.Http;
 ///     承载：设备描述、三服务 SCPD、三服务 SOAP 控制端点、GENA 事件订阅（最小实现）。
 ///     注意：DLNA 用的 SUBSCRIBE/UNSUBSCRIBE 不是标准 HTTP 方法，用 MapMethods 接受任意 verb。
 /// </summary>
-public sealed class DeviceHttpEndpoints(AppOptions opts, LogSink log)
+public sealed class DeviceHttpEndpoints(AppOptions opts, LogSink log, MediaCache cache)
 {
     private readonly Dictionary<(string, string), Func<SoapRequest, Task<IReadOnlyList<(string, string)>>>> _handlers = new();
 
@@ -54,7 +56,97 @@ public sealed class DeviceHttpEndpoints(AppOptions opts, LogSink log)
             return Results.Ok();
         });
 
+        // 本地缓存流：用于"投屏端临时流"被改写后的回放
+        // {name} 仅作为文件名提示（部分电视会按扩展名挑解码器），实际只看 {id}
+        endpoints.MapMethods("/cache/{id}/{name}", ["GET", "HEAD"], HandleCacheStreamAsync);
+
         log.Info("HTTP", $"Endpoints mapped (will listen on http://{opts.BindAddress}:{opts.HttpPort}/)");
+    }
+
+    private async Task<IResult> HandleCacheStreamAsync(string id, string name, HttpRequest req, HttpResponse resp)
+    {
+        if (!Guid.TryParseExact(id, "N", out var guid))
+        {
+            return Results.NotFound();
+        }
+        if (!cache.TryGet(guid, out var entry))
+        {
+            return Results.NotFound();
+        }
+
+        resp.Headers[HeaderNames.AcceptRanges] = "bytes";
+        resp.Headers["Content-Disposition"] = $"inline; filename=\"{entry.FileName}\"";
+
+        var length = entry.Length;
+        var rangeHeader = req.Headers[HeaderNames.Range].ToString();
+
+        long start = 0;
+        long endInclusive = length - 1;
+        var partial = false;
+
+        if (!string.IsNullOrEmpty(rangeHeader)
+            && RangeHeaderValue.TryParse(rangeHeader, out var parsed)
+            && parsed.Unit == "bytes"
+            && parsed.Ranges.Count == 1)
+        {
+            var r = parsed.Ranges.First();
+            if (r.From.HasValue)
+            {
+                start = r.From.Value;
+                endInclusive = r.To ?? length - 1;
+            }
+            else if (r.To.HasValue)
+            {
+                // suffix-length: 后 N 字节
+                start = Math.Max(0, length - r.To.Value);
+                endInclusive = length - 1;
+            }
+
+            if (start >= length || endInclusive < start)
+            {
+                resp.StatusCode = StatusCodes.Status416RangeNotSatisfiable;
+                resp.Headers[HeaderNames.ContentRange] = $"bytes */{length}";
+                return Results.Empty;
+            }
+
+            endInclusive = Math.Min(endInclusive, length - 1);
+            partial = true;
+        }
+
+        var sendLength = endInclusive - start + 1;
+        resp.ContentType = entry.ContentType;
+        resp.ContentLength = sendLength;
+        if (partial)
+        {
+            resp.StatusCode = StatusCodes.Status206PartialContent;
+            resp.Headers[HeaderNames.ContentRange] = $"bytes {start}-{endInclusive}/{length}";
+        }
+        else
+        {
+            resp.StatusCode = StatusCodes.Status200OK;
+        }
+
+        if (HttpMethods.IsHead(req.Method))
+        {
+            return Results.Empty;
+        }
+
+        await using var fs = new FileStream(entry.Path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true);
+        fs.Seek(start, SeekOrigin.Begin);
+
+        var remaining = sendLength;
+        var buffer = new byte[81920];
+        var ct = req.HttpContext.RequestAborted;
+        while (remaining > 0 && !ct.IsCancellationRequested)
+        {
+            var toRead = (int)Math.Min(buffer.Length, remaining);
+            var read = await fs.ReadAsync(buffer.AsMemory(0, toRead), ct).ConfigureAwait(false);
+            if (read <= 0) break;
+            await resp.Body.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+            remaining -= read;
+        }
+
+        return Results.Empty;
     }
 
     private async Task<IResult> HandleSoapAsync(string service, HttpRequest httpReq)

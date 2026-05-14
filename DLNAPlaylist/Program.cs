@@ -167,7 +167,8 @@ services.AddSingleton(bus);
 services.AddSingleton(logSink);
 services.AddSingleton<AllowList>();
 services.AddSingleton<CurrentTargetHolder>();
-services.AddSingleton<IMediaUrlResolver, PassthroughMediaUrlResolver>();
+services.AddSingleton<MediaCache>();
+services.AddSingleton<IMediaUrlResolver, LocalCachingMediaUrlResolver>();
 
 // 命令 channel —— 协调器是消费者，其他人是生产者
 var commandChannel = Channel.CreateUnbounded<CoordinatorCommand>();
